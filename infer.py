@@ -18,12 +18,15 @@ from pathlib import Path
 
 import numpy as np
 from torch.utils.data import DataLoader
+from torchvision.ops.boxes import batched_nms
 import datasets
 import util.misc as utils
 import datasets.samplers as samplers
 from datasets import build_dataset, get_coco_api_from_dataset
 from engine import evaluate, train_one_epoch
 from models import build_model
+import cv2
+from util import box_ops
 
 
 def get_args_parser():
@@ -124,7 +127,7 @@ def get_args_parser():
     parser.add_argument('--start_epoch', default=0, type=int, metavar='N',
                         help='start epoch')
     parser.add_argument('--eval', action='store_true')
-    parser.add_argument('--num_workers', default=0, type=int)
+    parser.add_argument('--num_workers', default=2, type=int)
     parser.add_argument('--cache_mode', default=False, action='store_true', help='whether to cache images on memory')
     parser.add_argument('--num_classes', default=91, type=int) # By default, Model was trained on 91 classes
 
@@ -281,70 +284,76 @@ def main(args):
                 lr_scheduler.step_size = args.lr_drop
                 lr_scheduler.base_lrs = list(map(lambda group: group['initial_lr'], optimizer.param_groups))
             lr_scheduler.step(lr_scheduler.last_epoch)
-            # args.start_epoch = checkpoint['epoch'] + 1
-        # check the resumed model
-        # if not args.eval:
-        #     test_stats, coco_evaluator = evaluate(
-        #         model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir
-        #     )
+            args.start_epoch = checkpoint['epoch'] + 1
     
+    model.eval()
+
     if args.eval:
-        test_stats, coco_evaluator = evaluate(model, criterion, postprocessors,
-                                              data_loader_val, base_ds, device, args.output_dir)
-        if args.output_dir:
-            utils.save_on_master(coco_evaluator.coco_eval["bbox"].eval, output_dir / "eval.pth")
-        return
+        # test_stats, coco_evaluator = evaluate(model, criterion, postprocessors,
+        #                                       data_loader_val, base_ds, device, args.output_dir)
+        # if args.output_dir:
+        #     utils.save_on_master(coco_evaluator.coco_eval["bbox"].eval, output_dir / "eval.pth")
+        # return
+        img = cv2.imread('/workspace/datasets/UoS_Drone/beets/images/_193.png')
+        orig = img.copy()
+        img_h, img_w= img.shape[0], img.shape[1]
+        img = np.transpose(torch.tensor(img).div(255.0), (2, 0, 1))
+        img = np.expand_dims(img, axis=0)
+        img = torch.tensor(img, device=device)
+        outs = model(img)
+        out_logits, out_bbox = outs['pred_logits'], outs['pred_boxes']
+        bs, n_queries, n_cls = outs['pred_logits'].shape
+        prob = out_logits.sigmoid()
 
-    print("Start training")
-    start_time = time.time()
-    for epoch in range(args.start_epoch, args.epochs):
-        if args.distributed:
-            sampler_train.set_epoch(epoch)
-        train_stats = train_one_epoch(
-            model, criterion, data_loader_train, optimizer, device, epoch, args.clip_max_norm)
-        lr_scheduler.step()
-        if args.output_dir:
-            checkpoint_paths = [output_dir / 'checkpoint.pth']
-            # extra checkpoint before LR drop and every 5 epochs
-            if (epoch + 1) % args.lr_drop == 0 or (epoch + 1) % 5 == 0:
-                checkpoint_paths.append(output_dir / f'checkpoint{epoch:04}.pth')
-            for checkpoint_path in checkpoint_paths:
-                utils.save_on_master({
-                    'model': model_without_ddp.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'lr_scheduler': lr_scheduler.state_dict(),
-                    'epoch': epoch,
-                    'args': args,
-                }, checkpoint_path)
+        all_scores = prob.view(bs, n_queries * n_cls).to(out_logits.device)
+        all_indexes = torch.arange(n_queries * n_cls)[None].repeat(bs, 1).to(out_logits.device)
+        all_boxes = all_indexes // out_logits.shape[2]
+        all_labels = all_indexes % out_logits.shape[2]
+        boxes = box_ops.box_cxcywh_to_xyxy(out_bbox)
+        boxes = torch.gather(boxes, 1, all_boxes.unsqueeze(-1).repeat(1,1,4))
+        img_h = torch.tensor([img_h, img_h]).to(device)
+        img_w = torch.tensor([img_w, img_w]).to(device)
+        scale_fct = torch.stack([img_w, img_h, img_w, img_h], dim=1)
+        boxes = boxes[0, :, :] * scale_fct[0, None, :]
+        boxes = boxes[None, :, :]
+        # boxes = boxes * scale_fct[:, None, :]
+        results = []
+        for b in range(bs):
+            box = boxes[b]
+            score = all_scores[b]
+            lbls = all_labels[b]
 
-        test_stats, coco_evaluator = evaluate(
-            model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir
-        )
+            if n_queries * n_cls > 10000:
+                pre_topk = score.topk(10000).indices
+                box = box[pre_topk]
+                score = score[pre_topk]
+                lbls = lbls[pre_topk]
 
-        log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
-                     **{f'test_{k}': v for k, v in test_stats.items()},
-                     'epoch': epoch,
-                     'n_parameters': n_parameters}
-
-        if args.output_dir and utils.is_main_process():
-            with (output_dir / "log.txt").open("a") as f:
-                f.write(json.dumps(log_stats) + "\n")
-
-            # for evaluation logs
-            if coco_evaluator is not None:
-                (output_dir / 'eval').mkdir(exist_ok=True)
-                if "bbox" in coco_evaluator.coco_eval:
-                    filenames = ['latest.pth']
-                    if epoch % 50 == 0:
-                        filenames.append(f'{epoch:03}.pth')
-                    for name in filenames:
-                        torch.save(coco_evaluator.coco_eval["bbox"].eval,
-                                   output_dir / "eval" / name)
-
-    total_time = time.time() - start_time
-    total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-    print('Training time {}'.format(total_time_str))
-
+            keep_inds = batched_nms(box, score, lbls, 0.7)[:100]
+            results.append({
+                'scores': score[keep_inds],
+                'labels': lbls[keep_inds],
+                'boxes':  box[keep_inds],
+            })
+        boxes = results[0]['boxes'].detach().cpu().numpy().astype(np.int64)
+        scores = results[0]['scores']
+        labels = results[0]['labels'].detach().cpu().numpy()
+        for idx in range(results[0]['boxes'].shape[0]):
+            cv2.rectangle(orig,
+                          (boxes[idx, 0], boxes[idx, 1]),
+                          (boxes[idx, 2], boxes[idx, 3]),
+                          color=(255, 0, 0),
+                          thickness=3)
+            cv2.putText(orig, 
+                        str(labels[idx]),
+                        (boxes[idx, 0], boxes[idx, 1]-5),
+                        fontFace=cv2.FONT_HERSHEY_SIMPLEX,
+                        fontScale=1,
+                        color=(255, 0, 0),
+                        thickness=3)
+        cv2.imshow('figure', orig)
+        cv2.waitKey()
+        cv2.destroyWindow('figure')
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser('Deformable DETR training and evaluation script', parents=[get_args_parser()])

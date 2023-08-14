@@ -1,0 +1,8 @@
+__pycache__/
+ *.pyc
+*.pth
+*.Identifier
+models/ops/build
+models/ops/dist
+models/ops/*.egg-info
+output_*/

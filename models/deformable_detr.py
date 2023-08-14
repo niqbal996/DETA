@@ -486,10 +486,11 @@ class NMSPostProcess(nn.Module):
             score = all_scores[b]
             lbls = all_labels[b]
 
-            pre_topk = score.topk(10000).indices
-            box = box[pre_topk]
-            score = score[pre_topk]
-            lbls = lbls[pre_topk]
+            if n_queries * n_cls > 10000:
+                pre_topk = score.topk(10000).indices
+                box = box[pre_topk]
+                score = score[pre_topk]
+                lbls = lbls[pre_topk]
 
             keep_inds = batched_nms(box, score, lbls, 0.7)[:100]
             results.append({
@@ -518,9 +519,19 @@ class MLP(nn.Module):
 
 
 def build(args):
+    # num_classes = 20 if args.dataset_file != 'coco' else 91
+    # if args.dataset_file != 'coco':
+    #     num_classes = 20
+    # elif args.dataset_file != 'beets':
+    #     num_classes = 3
+    # elif args.dataset_file == "coco_panoptic":
+    #     num_classes = 250
+    # else:
+    #     num_classes = 91
     num_classes = 20 if args.dataset_file != 'coco' else 91
-    if args.dataset_file == "coco_panoptic":
-        num_classes = 250
+    # coco has 91 classes originally.
+    num_classes = args.num_classes if args.num_classes != 91 else 91 
+    print("Building final layer with classes : ", num_classes)
     device = torch.device(args.device)
 
     backbone = build_backbone(args)
