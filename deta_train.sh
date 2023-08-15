@@ -1,0 +1,2 @@
+#!/usr/bin/env bash
+GPUS_PER_NODE=1 ./tools/run_dist_launch.sh 1 ./configs/deta.sh --coco_path /netscratch/naeem/phenobench/ --num_classes 3 --num_queries 400 --batch_size 4 --output_dir /netscratch/naeem/deta_phenobench/exp1/ --resume adet_checkpoint0011.pth --num_workers 2
